@@ -1,0 +1,445 @@
+function doGet(e) {
+  try {
+    var sheet = SpreadsheetApp
+      .getActiveSpreadsheet()
+      .getActiveSheet();
+
+    var lastRow = sheet.getLastRow();
+
+    if (lastRow < 2) {
+      return ContentService
+        .createTextOutput(JSON.stringify({
+          error: "No sensor data available"
+        }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // Ambil baris data paling terkini
+    var values = sheet.getRange(lastRow, 1, 1, 3).getValues()[0];
+
+    var result = {
+      timestamp: Utilities.formatDate(
+        new Date(values[0]),
+        Session.getScriptTimeZone(),
+        "dd/MM/yyyy HH:mm:ss"
+      ),
+      temperature: values[1],
+      humidity: values[2]
+    };
+
+    return ContentService
+      .createTextOutput(JSON.stringify(result))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (error) {
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        error: error.message
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+function doPost(e) {
+  try {
+    var sheet = SpreadsheetApp
+      .getActiveSpreadsheet()
+      .getActiveSheet();
+
+    var data = JSON.parse(e.postData.contents);
+
+    sheet.appendRow([
+      new Date(),
+      data.temperature,
+      data.humidity
+    ]);
+
+    return ContentService
+      .createTextOutput("Success")
+      .setMimeType(ContentService.MimeType.TEXT);
+
+  } catch (error) {
+    return ContentService
+      .createTextOutput("Error: " + error.message)
+      .setMimeType(ContentService.MimeType.TEXT);
+  }
+}
+
+/* =========================================
+   PBL TSO2 - SMA FORECASTING
+   Data source: DataSensor
+   Output sheet: Forecasts
+   Forecast period: Next 24 hours
+========================================= */
+
+// Generate forecasts manually
+
+function generateForecasts() {
+  var spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+
+  var sensorSheet = spreadsheet.getSheetByName("DataSensor");
+  if (!sensorSheet) {
+    throw new Error("DataSensor sheet not found!");
+  }
+
+  var forecastSheet = spreadsheet.getSheetByName("Forecasts");
+
+  if (!forecastSheet) {
+    forecastSheet = spreadsheet.insertSheet("Forecasts");
+  }
+
+  var lastRow = sensorSheet.getLastRow();
+
+  if (lastRow < 2) {
+    throw new Error("No sensor data available!");
+  }
+
+  // Read sensor data
+  var data = sensorSheet.getRange(
+    2, 1, lastRow - 1, 3
+  ).getValues();
+
+  // Group readings by hour
+  var hourlyData = {};
+
+  for (var i = 0; i < data.length; i++) {
+
+    var timestamp = data[i][0];
+
+    if (!(timestamp instanceof Date)) {
+      timestamp = new Date(timestamp);
+    }
+
+    var temperature = Number(data[i][1]);
+    var humidity = Number(data[i][2]);
+
+    if (
+      timestamp instanceof Date &&
+      !isNaN(timestamp.getTime()) &&
+      !isNaN(temperature) &&
+      !isNaN(humidity)
+    ) {
+
+      // Round timestamp down to the hour
+      var hourKey = new Date(
+        timestamp.getFullYear(),
+        timestamp.getMonth(),
+        timestamp.getDate(),
+        timestamp.getHours()
+      ).getTime();
+
+      if (!hourlyData[hourKey]) {
+        hourlyData[hourKey] = {
+          temperature: 0,
+          humidity: 0,
+          count: 0
+        };
+      }
+
+      hourlyData[hourKey].temperature += temperature;
+      hourlyData[hourKey].humidity += humidity;
+      hourlyData[hourKey].count++;
+    }
+  }
+
+  // Calculate hourly averages
+  var hourKeys = Object.keys(hourlyData)
+    .map(Number)
+    .sort(function(a, b) {
+      return a - b;
+    });
+
+  if (hourKeys.length === 0) {
+    throw new Error("No valid hourly data found!");
+  }
+
+  var hourlyTemperatures = [];
+  var hourlyHumidities = [];
+
+  for (var j = 0; j < hourKeys.length; j++) {
+
+    var hour = hourlyData[hourKeys[j]];
+
+    hourlyTemperatures.push(
+      hour.temperature / hour.count
+    );
+
+    hourlyHumidities.push(
+      hour.humidity / hour.count
+    );
+  }
+
+  // SMA using the latest 6 hourly averages
+  var windowSize = 6;
+
+  var forecastTemperature = calculateSMA(
+    hourlyTemperatures,
+    windowSize
+  );
+
+  var forecastHumidity = calculateSMA(
+    hourlyHumidities,
+    windowSize
+  );
+
+  // Forecast table headers
+  var headers = [
+    "Timestamp",
+    "Forecast Temperature",
+    "Upper Temperature",
+    "Lower Temperature",
+    "Forecast Humidity",
+    "Upper Humidity",
+    "Lower Humidity"
+  ];
+
+  forecastSheet.clearContents();
+
+  forecastSheet.getRange(
+    1, 1, 1, headers.length
+  ).setValues([headers]);
+
+  // Generate next 24 hours
+  var forecastData = [];
+
+  var lastHour = hourKeys[hourKeys.length - 1];
+
+  for (var h = 1; h <= 24; h++) {
+
+    var futureTimestamp = new Date(
+      lastHour + h * 60 * 60 * 1000
+    );
+
+    forecastData.push([
+      futureTimestamp,
+      forecastTemperature,
+      forecastTemperature * 1.1,
+      forecastTemperature * 0.9,
+      forecastHumidity,
+      forecastHumidity * 1.1,
+      forecastHumidity * 0.9
+    ]);
+  }
+
+  forecastSheet.getRange(
+    2, 1, forecastData.length, headers.length
+  ).setValues(forecastData);
+
+  forecastSheet.getRange(2, 1, 24, 1)
+    .setNumberFormat("dd/MM/yyyy HH:mm:ss");
+
+  forecastSheet.getRange(2, 2, 24, 6)
+    .setNumberFormat("0.00");
+
+  Logger.log("Hourly SMA forecast generated successfully!");
+}
+
+
+// Simple Moving Average calculation
+function calculateSMA(values, windowSize) {
+
+  if (values.length < windowSize) {
+    windowSize = values.length;
+  }
+
+  var sum = 0;
+
+  for (
+    var i = values.length - windowSize;
+    i < values.length;
+    i++
+  ) {
+    sum += values[i];
+  }
+
+  return sum / windowSize;
+}
+
+
+function evaluateForecastAccuracy() {
+
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sensorSheet = ss.getSheetByName("DataSensor");
+  var accuracySheet = ss.getSheetByName("Accuracy");
+
+  if (!sensorSheet || !accuracySheet) {
+    throw new Error("DataSensor or Accuracy sheet not found!");
+  }
+
+  var lastRow = sensorSheet.getLastRow();
+
+  if (lastRow < 3) {
+    throw new Error("Not enough sensor data!");
+  }
+
+  var data = sensorSheet.getRange(
+    2, 1, lastRow - 1, 3
+  ).getValues();
+
+  var hourly = {};
+
+  // Group sensor readings by hour
+  for (var i = 0; i < data.length; i++) {
+
+    var timestamp = data[i][0];
+
+    if (!(timestamp instanceof Date)) {
+      var parts = String(timestamp).match(
+        /^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/
+      );
+
+      if (parts) {
+        timestamp = new Date(
+          Number(parts[3]),
+          Number(parts[2]) - 1,
+          Number(parts[1]),
+          Number(parts[4]),
+          Number(parts[5]),
+          Number(parts[6] || 0)
+        );
+      } else {
+        continue;
+      }
+    }
+
+    var temp = Number(data[i][1]);
+    var hum = Number(data[i][2]);
+
+    if (
+      isNaN(timestamp.getTime()) ||
+      !isFinite(temp) ||
+      !isFinite(hum)
+    ) {
+      continue;
+    }
+
+    var hourKey = new Date(
+      timestamp.getFullYear(),
+      timestamp.getMonth(),
+      timestamp.getDate(),
+      timestamp.getHours()
+    ).getTime();
+
+    if (!hourly[hourKey]) {
+      hourly[hourKey] = {
+        temp: 0,
+        hum: 0,
+        count: 0
+      };
+    }
+
+    hourly[hourKey].temp += temp;
+    hourly[hourKey].hum += hum;
+    hourly[hourKey].count++;
+  }
+
+  var keys = Object.keys(hourly)
+    .map(Number)
+    .sort(function(a, b) {
+      return a - b;
+    });
+
+  var hourlyTemp = [];
+  var hourlyHum = [];
+
+  for (var j = 0; j < keys.length; j++) {
+
+    hourlyTemp.push(
+      hourly[keys[j]].temp / hourly[keys[j]].count
+    );
+
+    hourlyHum.push(
+      hourly[keys[j]].hum / hourly[keys[j]].count
+    );
+  }
+
+  if (keys.length < 2) {
+    throw new Error(
+      "Need at least 2 different hours of sensor data!"
+    );
+  }
+
+  var headers = [
+    "Timestamp",
+    "Actual Temperature",
+    "Forecast Temperature",
+    "Temperature Absolute Error",
+    "Actual Humidity",
+    "Forecast Humidity",
+    "Humidity Absolute Error"
+  ];
+
+  var results = [];
+
+  // Test each hour using only previous hourly readings
+  for (var k = 1; k < keys.length; k++) {
+
+    var start = Math.max(0, k - 6);
+
+    var previousTemp = hourlyTemp.slice(start, k);
+    var previousHum = hourlyHum.slice(start, k);
+
+    var predictedTemp = previousTemp.reduce(
+      function(a, b) { return a + b; }, 0
+    ) / previousTemp.length;
+
+    var predictedHum = previousHum.reduce(
+      function(a, b) { return a + b; }, 0
+    ) / previousHum.length;
+
+    var actualTemp = hourlyTemp[k];
+    var actualHum = hourlyHum[k];
+
+    results.push([
+      new Date(keys[k]),
+      actualTemp,
+      predictedTemp,
+      Math.abs(actualTemp - predictedTemp),
+      actualHum,
+      predictedHum,
+      Math.abs(actualHum - predictedHum)
+    ]);
+  }
+
+  accuracySheet.clearContents();
+
+  accuracySheet.getRange(
+    1, 1, 1, headers.length
+  ).setValues([headers]);
+
+  accuracySheet.getRange(
+    2, 1, results.length, headers.length
+  ).setValues(results);
+
+  // Calculate Mean Absolute Error
+  var maeTemp = results.reduce(
+    function(sum, row) {
+      return sum + row[3];
+    }, 0
+  ) / results.length;
+
+  var maeHum = results.reduce(
+    function(sum, row) {
+      return sum + row[6];
+    }, 0
+  ) / results.length;
+
+  accuracySheet.getRange("I1").setValue("Accuracy Summary");
+  accuracySheet.getRange("I2").setValue("Temperature MAE");
+  accuracySheet.getRange("J2").setValue(maeTemp);
+  accuracySheet.getRange("I3").setValue("Humidity MAE");
+  accuracySheet.getRange("J3").setValue(maeHum);
+
+  accuracySheet.getRange(2, 1, results.length, 1)
+    .setNumberFormat("dd/MM/yyyy HH:mm:ss");
+
+  accuracySheet.getRange(2, 2, results.length, 6)
+    .setNumberFormat("0.00");
+
+  accuracySheet.getRange("J2:J3")
+    .setNumberFormat("0.00");
+
+  SpreadsheetApp.getUi().alert(
+    "Accuracy testing completed!"
+  );
+}
